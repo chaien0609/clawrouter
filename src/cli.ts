@@ -108,7 +108,7 @@ function parseArgs(args: string[]): {
       result.report = true;
       const next = args[i + 1];
       if (next && ["daily", "weekly", "monthly"].includes(next)) {
-        result.reportPeriod = next as any;
+        result.reportPeriod = next as "daily" | "weekly" | "monthly";
         i++;
         if (args[i + 1] === "--json") {
           result.reportJson = true;
