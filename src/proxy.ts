@@ -104,6 +104,34 @@ const HEALTH_CHECK_TIMEOUT_MS = 2_000; // Timeout for checking existing proxy
 const RATE_LIMIT_COOLDOWN_MS = 60_000; // 60 seconds cooldown for rate-limited models
 const PORT_RETRY_ATTEMPTS = 5; // Max attempts to bind port (handles TIME_WAIT)
 const PORT_RETRY_DELAY_MS = 1_000; // Delay between retry attempts
+const BODY_READ_TIMEOUT_MS = 60_000; // 60 seconds for body stream to complete
+
+async function readBodyWithTimeout(
+  body: ReadableStream<Uint8Array> | null,
+  timeoutMs: number = BODY_READ_TIMEOUT_MS,
+): Promise<Uint8Array[]> {
+  if (!body) return [];
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+
+  try {
+    while (true) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Body read timeout")), timeoutMs),
+        ),
+      ]);
+      if (result.done) break;
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return chunks;
+}
 
 /**
  * Transform upstream payment errors into user-friendly messages.
@@ -1059,15 +1087,9 @@ async function proxyPartnerRequest(
 
   // Stream response body
   if (upstream.body) {
-    const reader = upstream.body.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        safeWrite(res, Buffer.from(value));
-      }
-    } finally {
-      reader.releaseLock();
+    const chunks = await readBodyWithTimeout(upstream.body);
+    for (const chunk of chunks) {
+      safeWrite(res, Buffer.from(chunk));
     }
   }
 
@@ -1109,17 +1131,24 @@ async function uploadDataUriToHost(dataUri: string): Promise<string> {
   form.append("reqtype", "fileupload");
   form.append("fileToUpload", blob, `image.${ext}`);
 
-  const resp = await fetch("https://catbox.moe/user/api.php", {
-    method: "POST",
-    body: form,
-  });
+  const uploadController = new AbortController();
+  const uploadTimeout = setTimeout(() => uploadController.abort(), 30_000);
+  try {
+    const resp = await fetch("https://catbox.moe/user/api.php", {
+      method: "POST",
+      body: form,
+      signal: uploadController.signal,
+    });
 
-  if (!resp.ok) throw new Error(`catbox.moe upload failed: HTTP ${resp.status}`);
-  const result = await resp.text();
-  if (result.startsWith("https://")) {
-    return result.trim();
+    if (!resp.ok) throw new Error(`catbox.moe upload failed: HTTP ${resp.status}`);
+    const result = await resp.text();
+    if (result.startsWith("https://")) {
+      return result.trim();
+    }
+    throw new Error(`catbox.moe upload failed: ${result}`);
+  } finally {
+    clearTimeout(uploadTimeout);
   }
-  throw new Error(`catbox.moe upload failed: ${result}`);
 }
 
 /**
@@ -1722,7 +1751,8 @@ async function tryModelRequest(
     // Check for provider errors
     if (response.status !== 200) {
       // Clone response to read body without consuming it
-      const errorBody = await response.text();
+      const errorBodyChunks = await readBodyWithTimeout(response.body);
+      const errorBody = Buffer.concat(errorBodyChunks).toString();
       const isProviderErr = isProviderError(response.status, errorBody);
 
       return {
@@ -1737,7 +1767,8 @@ async function tryModelRequest(
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("json") || contentType.includes("text")) {
       try {
-        const responseBody = await response.clone().text();
+        const clonedChunks = await readBodyWithTimeout(response.clone().body);
+        const responseBody = Buffer.concat(clonedChunks).toString();
         const degradedReason = detectDegradedSuccessResponse(responseBody);
         if (degradedReason) {
           return {
@@ -2950,17 +2981,7 @@ async function proxyRequest(
       // OpenClaw expects: object="chat.completion.chunk" with choices[].delta (not message)
       // We emit proper incremental deltas to match OpenAI's streaming format exactly
       if (upstream.body) {
-        const reader = upstream.body.getReader();
-        const chunks: Uint8Array[] = [];
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-          }
-        } finally {
-          reader.releaseLock();
-        }
+        const chunks = await readBodyWithTimeout(upstream.body);
 
         // Combine chunks and transform to streaming format
         const jsonBody = Buffer.concat(chunks);
@@ -3153,15 +3174,9 @@ async function proxyRequest(
       // Collect full body for possible notice injection
       const bodyParts: Buffer[] = [];
       if (upstream.body) {
-        const reader = upstream.body.getReader();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            bodyParts.push(Buffer.from(value));
-          }
-        } finally {
-          reader.releaseLock();
+        const chunks = await readBodyWithTimeout(upstream.body);
+        for (const chunk of chunks) {
+          bodyParts.push(Buffer.from(chunk));
         }
       }
 
